@@ -1,231 +1,341 @@
-"""Animated world map showing sequential flight legs with great-circle routes."""
+"""Animated world map of May 2026 flight legs — reference-style.
+
+Inspired stylistically by a flight itinerary infographic: Natural Earth
+shaded-relief background, dashed leg-colored routes, numbered callout
+badges, and a rotating airplane icon at the leading edge.
+"""
 from __future__ import annotations
 
-import os
-from pathlib import Path
+from pathlib import Path as FsPath
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import FancyBboxPatch
 from matplotlib.transforms import offset_copy
 from PIL import Image
 from pyproj import Geod
 
 GEOD = Geod(ellps="WGS84")
 
+# (lon, lat, country-label)
 CITIES = {
-    "Austin":        (-97.7431, 30.2672),
-    "London":        ( -0.1276, 51.5074),
-    "Bangalore":     ( 77.5946, 12.9716),
-    "Singapore":     (103.8198,  1.3521),
-    "San Francisco": (-122.4194, 37.7749),
+    "Austin":        (-97.7431, 30.2672, "USA"),
+    "London":        ( -0.1276, 51.5074, "UK"),
+    "Bangalore":     ( 77.5946, 12.9716, "INDIA"),
+    "Singapore":     (103.8198,  1.3521, "SINGAPORE"),
+    "San Francisco": (-122.4194, 37.7749, "USA"),
 }
 
-# Label-offset hints (text-anchor, dx_pts, dy_pts)
 CITY_LABEL_OFFSET = {
-    "Austin":        ("right",  -8, -10),
-    "London":        ("left",    8,  10),
-    "Bangalore":     ("left",   10,   2),
-    "Singapore":     ("left",   10,  -2),
-    "San Francisco": ("right",  -8,  10),
+    "Austin":        ("left",    10,  -10),
+    "London":        ("left",    10,   -2),
+    "Bangalore":     ("left",    10,   -2),
+    "Singapore":     ("left",    10,  -10),
+    "San Francisco": ("left",    10,    2),
 }
 
+# One entry per "leg" the user described (4 legs, 4 dates, 4 colors)
 LEGS = [
-    {"date": "May 11", "from": "Austin",        "to": "London"},
-    {"date": "May 12", "from": "London",        "to": "Bangalore"},
-    {"date": "May 15", "from": "Bangalore",     "to": "Singapore"},
-    {"date": "May 19", "from": "Singapore",     "to": "San Francisco"},
-    {"date": "May 19", "from": "San Francisco", "to": "Austin"},
+    {"date": "May 11", "label": "Austin to London",
+     "color": "#2e7dd1", "segments": [("Austin", "London")]},
+    {"date": "May 12", "label": "London to Bangalore",
+     "color": "#8e44ad", "segments": [("London", "Bangalore")]},
+    {"date": "May 15", "label": "Bangalore to Singapore",
+     "color": "#1f9d55", "segments": [("Bangalore", "Singapore")]},
+    {"date": "May 19", "label": "Singapore to San Francisco\nto Austin",
+     "color": "#c0392b", "segments": [("Singapore", "San Francisco"),
+                                      ("San Francisco", "Austin")]},
 ]
 
-# Hint where each leg's label sits — (anchor_lon, anchor_lat) in degrees.
-# Placed manually so labels don't overlap each other or city dots.
-LEG_LABEL_ANCHOR = {
-    0: ( -45,  62),   # May 11: Austin -> London — over N Atlantic / Greenland
-    1: (  20,  30),   # May 12: London -> Bangalore — Mediterranean / N Africa
-    2: (  95, -18),   # May 15: Bangalore -> Singapore — Indian Ocean (south)
-    3: ( 175,  55),   # May 19: Singapore -> SF — over N Pacific
-    4: (-105,  18),   # May 19: SF -> Austin — over Mexico
+# Placement of each numbered badge/callout: (lon, lat, side)
+# side controls which way the box extends from the badge dot.
+LEG_BADGE = {
+    0: (-55,  72, "right"),
+    1: ( 18,  38, "right"),
+    2: ( 95, -22, "right"),
+    3: (175,  52, "left"),
 }
 
-FRAMES_PER_LEG = 26     # plane in motion
-HOLD_FRAMES = 8         # pause after each leg lands (label settles in)
-END_PAUSE_FRAMES = 36   # final pause before loop restarts
+OCEAN_LABELS = [
+    ("ARCTIC OCEAN",         -10,  78),
+    ("NORTH ATLANTIC\nOCEAN", -40,  30),
+    ("NORTH PACIFIC OCEAN",  -160, 35),
+    ("SOUTH PACIFIC\nOCEAN", -130, -25),
+    ("SOUTH ATLANTIC\nOCEAN", -25, -30),
+    ("INDIAN OCEAN",          80, -25),
+]
+
+FRAMES_PER_SEGMENT = 26
+HOLD_FRAMES = 10        # pause after each leg lands
+INTER_SEGMENT_PAUSE = 4 # pause at intermediate stop within a multi-segment leg
+END_PAUSE_FRAMES = 38
 FPS = 18
 
-ROUTE_COLOR = "#d7263d"
-PLANE_COLOR = "#ffcf00"
-CITY_COLOR  = "#1a1a1a"
+# Map projection — center around 30°E so Asia is on the right and the
+# Singapore→SF great circle exits the right edge and re-enters at the left.
+PROJ = ccrs.PlateCarree(central_longitude=30)
 
 
 def great_circle(lon1: float, lat1: float, lon2: float, lat2: float, n: int = 200) -> np.ndarray:
-    """Return (n+2, 2) array of (lon, lat) along the great circle."""
     inner = GEOD.npts(lon1, lat1, lon2, lat2, n)
     return np.array([(lon1, lat1), *inner, (lon2, lat2)])
 
 
-# Pre-compute routes
-for leg in LEGS:
-    lo1, la1 = CITIES[leg["from"]]
-    lo2, la2 = CITIES[leg["to"]]
-    leg["points"] = great_circle(lo1, la1, lo2, la2, 240)
+# Build the per-segment animation timeline
+SEGMENTS = []
+for leg_idx, leg in enumerate(LEGS):
+    for seg_idx, (c1, c2) in enumerate(leg["segments"]):
+        lo1, la1 = CITIES[c1][:2]
+        lo2, la2 = CITIES[c2][:2]
+        SEGMENTS.append({
+            "leg_idx": leg_idx,
+            "from": c1, "to": c2,
+            "geo": great_circle(lo1, la1, lo2, la2, 240),
+            "color": leg["color"],
+            "is_last_in_leg": seg_idx == len(leg["segments"]) - 1,
+            "is_first_in_leg": seg_idx == 0,
+        })
+
+
+def heading_deg(prev_pt: np.ndarray, curr_pt: np.ndarray) -> float:
+    dlon = curr_pt[0] - prev_pt[0]
+    # Handle antimeridian wrap
+    if dlon > 180:   dlon -= 360
+    if dlon < -180:  dlon += 360
+    dlat = curr_pt[1] - prev_pt[1]
+    return float(np.degrees(np.arctan2(dlat, dlon)))
 
 
 def setup_map(ax) -> None:
     ax.set_global()
-    ax.add_feature(cfeature.OCEAN,    facecolor="#cfe4f5", zorder=0)
-    ax.add_feature(cfeature.LAND,     facecolor="#f1e3c6", zorder=1)
-    ax.add_feature(cfeature.LAKES,    facecolor="#cfe4f5", edgecolor="none", zorder=1.1)
-    ax.add_feature(cfeature.COASTLINE, edgecolor="#6f6f6f", linewidth=0.45, zorder=2)
-    ax.add_feature(cfeature.BORDERS,   edgecolor="#9c9c9c", linewidth=0.3, alpha=0.7, zorder=2)
+    ax.stock_img()
+    # Boost ocean color with a translucent bright-blue overlay
+    ax.add_feature(cfeature.OCEAN, facecolor=(0.49, 0.75, 0.92, 0.45),
+                   edgecolor="none", zorder=1)
+    ax.add_feature(cfeature.LAKES, facecolor=(0.49, 0.75, 0.92, 0.55),
+                   edgecolor="none", zorder=1.1)
+    ax.add_feature(cfeature.COASTLINE, edgecolor="#5a5a5a", linewidth=0.4, zorder=2)
+
+
+def draw_ocean_labels(ax) -> None:
+    for text, lon, lat in OCEAN_LABELS:
+        ax.text(lon, lat, text,
+                transform=ccrs.PlateCarree(),
+                ha="center", va="center",
+                fontsize=7.5, color="#1a4f7a",
+                fontstyle="italic", alpha=0.85,
+                zorder=3)
 
 
 def draw_cities(ax) -> None:
-    for name, (lon, lat) in CITIES.items():
-        ax.plot(lon, lat, marker="o", markersize=6,
-                markerfacecolor=CITY_COLOR, markeredgecolor="white",
-                markeredgewidth=1.2, transform=ccrs.PlateCarree(), zorder=6)
+    fig = ax.figure
+    for name, (lon, lat, country) in CITIES.items():
+        ax.plot(lon, lat, marker="o", markersize=5,
+                markerfacecolor="#111", markeredgecolor="white",
+                markeredgewidth=1.0, transform=ccrs.PlateCarree(), zorder=8)
         anchor, dx, dy = CITY_LABEL_OFFSET[name]
-        ha = "right" if anchor == "right" else "left"
+        ha = {"left": "left", "right": "right", "center": "center"}[anchor]
         text_tf = offset_copy(ccrs.PlateCarree()._as_mpl_transform(ax),
-                              fig=ax.figure, x=dx, y=dy, units="points")
-        ax.text(lon, lat, name, transform=text_tf,
-                ha=ha, va="center", fontsize=10, fontweight="bold",
-                color="#1a1a1a",
-                path_effects=[],
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
-                          edgecolor="none", alpha=0.75),
-                zorder=7)
+                              fig=fig, x=dx, y=dy, units="points")
+        label = f"{name.upper()}\n({country})"
+        ax.text(lon, lat, label, transform=text_tf,
+                ha=ha, va="center", fontsize=8.5, fontweight="bold",
+                color="#111", linespacing=1.05,
+                bbox=dict(boxstyle="round,pad=0.18", facecolor="white",
+                          edgecolor="none", alpha=0.55),
+                zorder=9)
 
 
-def draw_route_label(ax, leg_idx: int, leg: dict) -> None:
-    label_lon, label_lat = LEG_LABEL_ANCHOR[leg_idx]
-    text = f"{leg['date']}: {leg['from']} → {leg['to']}"
-    ax.text(label_lon, label_lat, text,
-            transform=ccrs.PlateCarree(),
-            ha="center", va="center",
-            fontsize=9.5, fontweight="bold", color="#222",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff8d6",
-                      edgecolor=ROUTE_COLOR, linewidth=1.0, alpha=0.95),
-            zorder=8)
+def draw_completed_segment(ax, seg: dict) -> None:
+    pts = seg["geo"]
+    ax.plot(pts[:, 0], pts[:, 1], color=seg["color"], linewidth=1.8,
+            linestyle=(0, (6, 4)), transform=ccrs.Geodetic(),
+            zorder=4, solid_capstyle="round")
 
 
-def draw_completed_route(ax, leg: dict) -> None:
-    pts = leg["points"]
-    ax.plot(pts[:, 0], pts[:, 1], color=ROUTE_COLOR, linewidth=2.4,
-            transform=ccrs.Geodetic(), zorder=4, solid_capstyle="round")
-
-
-def draw_partial_route(ax, leg: dict, progress: float) -> None:
-    pts = leg["points"]
+def draw_partial_segment(ax, seg: dict, progress: float) -> None:
+    pts = seg["geo"]
     n = max(2, int(len(pts) * progress))
     sub = pts[:n]
-    ax.plot(sub[:, 0], sub[:, 1], color=ROUTE_COLOR, linewidth=2.4,
-            transform=ccrs.Geodetic(), zorder=4, solid_capstyle="round")
-    # Plane marker at leading edge
+    ax.plot(sub[:, 0], sub[:, 1], color=seg["color"], linewidth=1.8,
+            linestyle=(0, (6, 4)), transform=ccrs.Geodetic(),
+            zorder=4, solid_capstyle="round")
     head = sub[-1]
     prev = sub[-2]
-    # Compute heading for triangle rotation
-    dlon = head[0] - prev[0]
-    dlat = head[1] - prev[1]
-    angle = np.degrees(np.arctan2(dlat, dlon))
-    ax.plot(head[0], head[1], marker=(3, 0, angle - 90), markersize=14,
-            markerfacecolor=PLANE_COLOR, markeredgecolor="#1a1a1a",
-            markeredgewidth=1.0, transform=ccrs.PlateCarree(), zorder=9)
+    angle = heading_deg(prev, head)
+    # ✈ glyph default points left; rotation+180 makes it point along heading
+    ax.text(head[0], head[1], "✈",
+            transform=ccrs.PlateCarree(),
+            ha="center", va="center",
+            fontsize=20, color=seg["color"],
+            rotation=angle + 180, rotation_mode="anchor",
+            zorder=10)
 
 
-def render_frame(frame_idx: int, total_anim_frames: int, out_path: Path) -> None:
-    fig = plt.figure(figsize=(10, 10), dpi=108)
-    fig.patch.set_facecolor("#0d1b2a")
-    proj = ccrs.Robinson(central_longitude=30)
-    ax = plt.axes([0.02, 0.06, 0.96, 0.88], projection=proj)
+def draw_leg_badge(ax, leg_idx: int, leg: dict) -> None:
+    """Numbered colored circle + callout box, reference-style."""
+    fig = ax.figure
+    lon, lat, side = LEG_BADGE[leg_idx]
+    color = leg["color"]
+
+    # Badge circle (numbered)
+    ax.plot(lon, lat, marker="o", markersize=18,
+            markerfacecolor=color, markeredgecolor="white",
+            markeredgewidth=1.5, transform=ccrs.PlateCarree(), zorder=11)
+    ax.text(lon, lat, str(leg_idx + 1),
+            transform=ccrs.PlateCarree(),
+            ha="center", va="center",
+            fontsize=10, fontweight="bold", color="white", zorder=12)
+
+    # Callout text box, offset to one side of the badge
+    if side == "right":
+        offx, ha = 26, "left"
+    else:
+        offx, ha = -26, "right"
+    text_tf = offset_copy(ccrs.PlateCarree()._as_mpl_transform(ax),
+                          fig=fig, x=offx, y=0, units="points")
+    text = f"{leg['date']}\n{leg['label']}"
+    ax.text(lon, lat, text, transform=text_tf,
+            ha=ha, va="center",
+            fontsize=9, color="#111",
+            linespacing=1.15,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                      edgecolor=color, linewidth=1.6, alpha=0.95),
+            zorder=11)
+
+
+def draw_title(fig) -> None:
+    fig.text(0.5, 0.94, "FLIGHT ITINERARY: MAY 11 – MAY 19",
+             ha="center", va="center",
+             fontsize=16, fontweight="bold", color="#111",
+             bbox=dict(boxstyle="round,pad=0.45", facecolor="white",
+                       edgecolor="#111", linewidth=1.2))
+
+
+def compute_timeline() -> list[dict]:
+    """Return per-frame state: list of dicts describing what to render."""
+    frames = []
+    # Segments are animated in order. Each segment: FRAMES_PER_SEGMENT.
+    # Between segments within a leg: INTER_SEGMENT_PAUSE (hold partial route + plane).
+    # After last segment of a leg: HOLD_FRAMES (show badge + label).
+    for seg_idx, seg in enumerate(SEGMENTS):
+        # In-flight frames
+        for i in range(FRAMES_PER_SEGMENT):
+            frames.append({"kind": "flight", "seg_idx": seg_idx,
+                           "progress": (i + 1) / FRAMES_PER_SEGMENT})
+        if seg["is_last_in_leg"]:
+            for _ in range(HOLD_FRAMES):
+                frames.append({"kind": "hold", "seg_idx": seg_idx, "progress": 1.0})
+        else:
+            for _ in range(INTER_SEGMENT_PAUSE):
+                frames.append({"kind": "hold", "seg_idx": seg_idx, "progress": 1.0})
+    # End pause: everything visible
+    for _ in range(END_PAUSE_FRAMES):
+        frames.append({"kind": "end_pause"})
+    return frames
+
+
+def state_at(frame: dict) -> tuple[set[int], int | None, float, set[int]]:
+    """Return (completed_segment_ids, active_segment_id_or_none,
+              active_progress, completed_leg_ids_with_visible_badge)."""
+    if frame["kind"] == "end_pause":
+        completed_segs = set(range(len(SEGMENTS)))
+        completed_legs = set(range(len(LEGS)))
+        return completed_segs, None, 1.0, completed_legs
+
+    seg_idx = frame["seg_idx"]
+    prog = frame["progress"]
+
+    if frame["kind"] == "flight":
+        completed_segs = set(range(seg_idx))
+        active = seg_idx
+    else:  # hold
+        completed_segs = set(range(seg_idx + 1))
+        active = None
+
+    completed_legs = set()
+    for li, leg in enumerate(LEGS):
+        seg_count = len(leg["segments"])
+        # Determine the first/last seg-index in SEGMENTS for this leg
+        offset = sum(len(LEGS[k]["segments"]) for k in range(li))
+        last_seg_for_leg = offset + seg_count - 1
+        if last_seg_for_leg in completed_segs:
+            completed_legs.add(li)
+    return completed_segs, active, prog, completed_legs
+
+
+def render_frame(frame: dict, out_path: FsPath) -> None:
+    # 1080 x 608 → 1.78:1 landscape (Instagram-friendly)
+    fig = plt.figure(figsize=(10.0, 5.63), dpi=108)
+    fig.patch.set_facecolor("#e8f1f7")
+    ax = plt.axes([0.0, 0.0, 1.0, 0.88], projection=PROJ)
     setup_map(ax)
-
-    # Title strip
-    fig.text(0.5, 0.955, "Around the World — May 2026",
-             ha="center", va="center", fontsize=18, fontweight="bold",
-             color="#f5f5f5")
-    fig.text(0.5, 0.028, "Austin → London → Bangalore → Singapore → SFO → Austin",
-             ha="center", va="center", fontsize=10.5, color="#cfd8e3")
-
+    draw_ocean_labels(ax)
     draw_cities(ax)
 
-    slot = FRAMES_PER_LEG + HOLD_FRAMES
-    animation_total = len(LEGS) * slot
-    in_end_pause = frame_idx >= animation_total
+    completed_segs, active, progress, completed_legs = state_at(frame)
 
-    if in_end_pause:
-        for i, leg in enumerate(LEGS):
-            draw_completed_route(ax, leg)
-            draw_route_label(ax, i, leg)
-    else:
-        active_leg = frame_idx // slot
-        sub = frame_idx % slot
-        in_flight = sub < FRAMES_PER_LEG
-        progress = ((sub + 1) / FRAMES_PER_LEG) if in_flight else 1.0
+    # Draw completed segments
+    for i, seg in enumerate(SEGMENTS):
+        if i in completed_segs:
+            draw_completed_segment(ax, seg)
 
-        for i, leg in enumerate(LEGS):
-            if i < active_leg:
-                draw_completed_route(ax, leg)
-                draw_route_label(ax, i, leg)
-            elif i == active_leg:
-                if in_flight:
-                    draw_partial_route(ax, leg, progress)
-                else:
-                    # Hold: leg has landed — show full route + label
-                    draw_completed_route(ax, leg)
-                    draw_route_label(ax, i, leg)
+    # Draw active in-flight segment
+    if active is not None:
+        draw_partial_segment(ax, SEGMENTS[active], progress)
+
+    # Draw badges for legs that have completed all their segments
+    for li in sorted(completed_legs):
+        draw_leg_badge(ax, li, LEGS[li])
+
+    draw_title(fig)
 
     fig.savefig(out_path, dpi=108, facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
 def main() -> None:
-    out_dir = Path("frames")
+    out_dir = FsPath("frames")
     out_dir.mkdir(exist_ok=True)
+    for old in out_dir.glob("*.png"):
+        old.unlink()
 
-    total_anim = len(LEGS) * (FRAMES_PER_LEG + HOLD_FRAMES)
-    total_frames = total_anim + END_PAUSE_FRAMES
+    frames = compute_timeline()
+    total = len(frames)
 
-    frame_paths: list[Path] = []
-    for i in range(total_frames):
-        path = out_dir / f"frame_{i:04d}.png"
-        render_frame(i, total_anim, path)
-        frame_paths.append(path)
-        if (i + 1) % 10 == 0 or i == total_frames - 1:
-            print(f"  rendered {i + 1}/{total_frames}")
+    paths: list[FsPath] = []
+    for i, fr in enumerate(frames):
+        p = out_dir / f"frame_{i:04d}.png"
+        render_frame(fr, p)
+        paths.append(p)
+        if (i + 1) % 15 == 0 or i == total - 1:
+            print(f"  rendered {i + 1}/{total}")
 
-    # Build GIF (with optimized palette)
     print("Building GIF...")
     images = []
-    for p in frame_paths:
-        img = Image.open(p).convert("RGB")
-        # Downscale to 720 for smaller GIF size (still very Instagram-friendly)
-        img = img.resize((720, 720), Image.LANCZOS)
+    for p in paths:
+        img = Image.open(p).convert("P", palette=Image.ADAPTIVE, colors=128)
+        w, h = img.size
+        new_w = 640
+        new_h = int(h * new_w / w)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
         images.append(img)
     duration_ms = int(1000 / FPS)
     images[0].save(
         "flight_map.gif",
-        save_all=True,
-        append_images=images[1:],
-        duration=duration_ms,
-        loop=0,
-        optimize=True,
-        disposal=2,
+        save_all=True, append_images=images[1:],
+        duration=duration_ms, loop=0, optimize=True, disposal=2,
     )
 
-    # Build MP4 too (Instagram converts GIFs to video on upload — MP4 = best quality)
     print("Building MP4...")
     with imageio.get_writer("flight_map.mp4", fps=FPS, codec="libx264",
                             quality=8, macro_block_size=1) as writer:
-        for p in frame_paths:
+        for p in paths:
             writer.append_data(imageio.imread(p))
 
-    print("Done.")
-    print("Outputs: flight_map.gif, flight_map.mp4")
+    print("Done. Outputs: flight_map.gif, flight_map.mp4")
 
 
 if __name__ == "__main__":
