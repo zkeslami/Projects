@@ -165,12 +165,12 @@ def draw_partial_segment(ax, seg: dict, progress: float) -> None:
     head = sub[-1]
     prev = sub[-2]
     angle = heading_deg(prev, head)
-    # ✈ glyph default points left; rotation+180 makes it point along heading
+    # ✈ glyph default points right; rotation == heading aligns nose with travel
     ax.text(head[0], head[1], "✈",
             transform=ccrs.PlateCarree(),
             ha="center", va="center",
             fontsize=20, color=seg["color"],
-            rotation=angle + 180, rotation_mode="anchor",
+            rotation=angle, rotation_mode="anchor",
             zorder=10)
 
 
