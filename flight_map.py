@@ -543,10 +543,24 @@ def main() -> None:
             print(f"  rendered {i + 1}/{total}")
 
     print("Building MP4...")
-    with imageio.get_writer("flight_map.mp4", fps=FPS, codec="libx264",
-                            quality=8, macro_block_size=1) as writer:
-        for p in paths:
-            writer.append_data(imageio.imread(p))
+    # Encode via ffmpeg directly so we control all the Instagram-required bits:
+    # H.264 main profile, yuv420p, +faststart (moov at front), and a silent
+    # AAC audio track — without audio Instagram sometimes treats the upload
+    # as a still photo.
+    import subprocess
+    pat = str(out_dir / "frame_%04d.png")
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(FPS), "-i", pat,
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-c:v", "libx264", "-profile:v", "main", "-level", "4.0",
+        "-pix_fmt", "yuv420p", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k", "-shortest",
+        "-movflags", "+faststart",
+        "flight_map.mp4",
+    ]
+    subprocess.run(cmd, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     print("Building GIF...")
     images = []
