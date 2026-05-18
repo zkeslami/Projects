@@ -21,11 +21,12 @@ from pyproj import Geod
 GEOD = Geod(ellps="WGS84")
 
 CITIES = {
-    "Austin":        (-97.7431, 30.2672, "USA"),
-    "London":        ( -0.1276, 51.5074, "UK"),
-    "Bangalore":     ( 77.5946, 12.9716, "INDIA"),
-    "Singapore":     (103.8198,  1.3521, "SINGAPORE"),
-    "San Francisco": (-122.4194, 37.7749, "USA"),
+    # (lon, lat, country, IATA code)
+    "Austin":        (-97.7431, 30.2672, "USA",       "AUS"),
+    "London":        ( -0.1276, 51.5074, "UK",        "LHR"),
+    "Bangalore":     ( 77.5946, 12.9716, "INDIA",     "BLR"),
+    "Singapore":     (103.8198,  1.3521, "SINGAPORE", "SIN"),
+    "San Francisco": (-122.4194, 37.7749, "USA",      "SFO"),
 }
 
 # Animation segments (the May 19 leg has two sub-segments)
@@ -60,6 +61,14 @@ TEXT_COLOR  = "#f0f0f0"
 ACCENT      = "#ffcb00"
 MUTED       = "#5a6c75"
 
+# Pre-generate a deterministic set of "stars" for the space background
+_rng = np.random.default_rng(42)
+N_STARS = 240
+_STAR_X = _rng.uniform(0.0, 1.0, N_STARS)
+_STAR_Y = _rng.uniform(0.0, 1.0, N_STARS)
+_STAR_SZ = _rng.uniform(0.4, 1.8, N_STARS)
+_STAR_AL = _rng.uniform(0.3, 0.95, N_STARS)
+
 
 def great_circle_points(lon1, lat1, lon2, lat2, n=240):
     inner = GEOD.npts(lon1, lat1, lon2, lat2, n)
@@ -70,6 +79,34 @@ for seg in SEGMENTS:
     lo1, la1 = CITIES[seg["from"]][:2]
     lo2, la2 = CITIES[seg["to"]][:2]
     seg["geo"] = great_circle_points(lo1, la1, lo2, la2, 240)
+    _, _, dist_m = GEOD.inv(lo1, la1, lo2, la2)
+    seg["distance_km"] = dist_m / 1000.0
+    # Estimate duration: 850 km/h cruise + 30 min for taxi/climb/descent
+    seg["duration_hours"] = seg["distance_km"] / 850.0 + 0.5
+    seg["from_code"] = CITIES[seg["from"]][3]
+    seg["to_code"]   = CITIES[seg["to"]][3]
+
+# Cumulative distance at the END of each segment (for the running km counter)
+_cum = 0.0
+for seg in SEGMENTS:
+    _cum += seg["distance_km"]
+    seg["cum_km_end"] = _cum
+
+TOTAL_DISTANCE_KM    = sum(s["distance_km"] for s in SEGMENTS)
+TOTAL_FLIGHT_HOURS   = sum(s["duration_hours"] for s in SEGMENTS)
+COUNTRIES_VISITED    = len({CITIES[c][2] for c in CITIES})  # 4 unique
+# Going east the entire trip is +24h around the world, but for display we
+# show the unique time zones crossed: AUS(CDT,-5) LHR(+1) BLR(+5.5) SIN(+8) SFO(-7) = 5
+TIMEZONES_TOUCHED    = 5
+
+
+def format_hours(h: float) -> str:
+    total_min = int(round(h * 60))
+    return f"{total_min // 60}h {total_min % 60:02d}m"
+
+
+def format_km(km: float) -> str:
+    return f"{int(round(km)):,} km"
 
 
 def interp_along(geo: np.ndarray, t: float) -> tuple[float, float]:
@@ -132,6 +169,15 @@ def render_frame(state: dict, out_path: FsPath) -> None:
     fig = plt.figure(figsize=(WIDTH / 120, HEIGHT / 120), dpi=120)
     fig.patch.set_facecolor(BG_COLOR)
 
+    # Star field across the entire figure (will be partially covered by the globe)
+    for i in range(N_STARS):
+        fig.add_artist(plt.Circle(
+            (_STAR_X[i], _STAR_Y[i]), radius=_STAR_SZ[i] * 0.0014,
+            transform=fig.transFigure,
+            facecolor=(1, 1, 1, _STAR_AL[i]),
+            edgecolor='none', zorder=0,
+        ))
+
     proj = ccrs.NearsidePerspective(
         central_longitude=state["cam_lon"],
         central_latitude=state["cam_lat"],
@@ -140,6 +186,7 @@ def render_frame(state: dict, out_path: FsPath) -> None:
     # Square globe axes centered in portrait frame
     # Frame is 1080×1920. Make axes 1080×1080 with 300px footer, 540px header
     ax = plt.axes([0.0, 300 / HEIGHT, 1.0, 1080 / HEIGHT], projection=proj)
+    ax.set_facecolor((0, 0, 0, 0))  # transparent so stars show through
     setup_globe(ax)
 
     route_halo = [pe.withStroke(linewidth=7.5, foreground="white", alpha=0.85)]
@@ -166,26 +213,83 @@ def render_frame(state: dict, out_path: FsPath) -> None:
                 path_effects=route_halo)
 
     # City dots (drawn always; cartopy hides ones on the far side)
-    for name, (lon, lat, _) in CITIES.items():
+    for name, (lon, lat, _, _) in CITIES.items():
         ax.plot(lon, lat, marker='o', markersize=7,
                 markerfacecolor=ACCENT, markeredgecolor='white',
                 markeredgewidth=1.4, transform=ccrs.PlateCarree(), zorder=8)
 
-    # Focus city label (only during departure/arrival pause)
+    # Focus city label (during departure/arrival pause)
     if state.get("focus_city"):
         city = state["focus_city"]
-        lon, lat, country = CITIES[city]
+        lon, lat, country, code = CITIES[city]
         from matplotlib.transforms import offset_copy
         tf = offset_copy(ccrs.PlateCarree()._as_mpl_transform(ax),
-                         fig=fig, x=0, y=26, units='points')
-        ax.text(lon, lat, f"{city.upper()}\n{country}",
+                         fig=fig, x=0, y=30, units='points')
+        ax.text(lon, lat, f"{city.upper()}\n{code}  ·  {country}",
                 transform=tf, ha='center', va='bottom',
                 fontsize=13, fontweight='bold', color='white',
-                linespacing=1.15,
-                bbox=dict(boxstyle='round,pad=0.4',
-                          facecolor=(0, 0, 0, 0.75),
+                linespacing=1.25,
+                bbox=dict(boxstyle='round,pad=0.45',
+                          facecolor=(0, 0, 0, 0.78),
                           edgecolor=ACCENT, linewidth=1.4),
                 zorder=12)
+
+    # Landing pulse: expanding white-on-color rings + "ARRIVED ✓" pop
+    if state.get("phase") == "arrival" and state.get("landing_pulse", 99) < 10:
+        i = state["landing_pulse"]
+        arr_lon, arr_lat = CITIES[state["active_segment"]["to"]][:2]
+        pulse_color = state["active_segment"]["color"]
+        for k in range(3):
+            phase = i - k * 2.5
+            if 0 <= phase < 6:
+                t = phase / 6.0
+                ring_size = 35 + t * 120
+                alpha = (1.0 - t) ** 1.3 * 0.95
+                # White outer halo
+                ax.plot(arr_lon, arr_lat, marker='o',
+                        markersize=ring_size,
+                        markerfacecolor='none',
+                        markeredgecolor='white',
+                        markeredgewidth=4.5,
+                        alpha=alpha * 0.55,
+                        transform=ccrs.PlateCarree(), zorder=13)
+                # Colored ring inside
+                ax.plot(arr_lon, arr_lat, marker='o',
+                        markersize=ring_size,
+                        markerfacecolor='none',
+                        markeredgecolor=pulse_color,
+                        markeredgewidth=3.0,
+                        alpha=alpha,
+                        transform=ccrs.PlateCarree(), zorder=14)
+        # "ARRIVED" pop near top of frame for first ~6 frames
+        if i < 6:
+            pop_a = max(0.0, (1.0 - i / 6.0) ** 0.7) * 0.95
+            fig.text(0.5, 0.84, "✓  ARRIVED",
+                     ha='center', va='center', fontsize=18,
+                     color=(*plt.matplotlib.colors.to_rgb(pulse_color), pop_a),
+                     fontweight='bold', family='monospace',
+                     bbox=dict(boxstyle='round,pad=0.4',
+                               facecolor=(0, 0, 0, 0.7 * pop_a),
+                               edgecolor=(*plt.matplotlib.colors.to_rgb(pulse_color), pop_a),
+                               linewidth=1.5))
+
+    # Contrail: a thin wisp behind the plane during flight
+    if state.get("phase") == "flight" and state.get("active_route") is not None:
+        seg = state["active_segment"]
+        pts = seg["geo"]
+        t = state["flight_t"]
+        n = max(2, int(len(pts) * t))
+        # Last ~12% of route is the contrail (the freshest)
+        tail_n = max(2, int(0.12 * len(pts)))
+        start = max(0, n - tail_n)
+        sub = pts[start:n]
+        # Draw as several segments with increasing alpha towards the head
+        for i in range(len(sub) - 1):
+            local_t = (i + 1) / len(sub)
+            ax.plot(sub[i:i + 2, 0], sub[i:i + 2, 1],
+                    color=(1, 1, 1, 0.15 + 0.65 * local_t),
+                    linewidth=2.4, solid_capstyle='round',
+                    transform=ccrs.Geodetic(), zorder=6)
 
     # Plane (rotation = heading in degrees; ✈ glyph default points right)
     if state.get("plane"):
@@ -198,15 +302,76 @@ def render_frame(state: dict, out_path: FsPath) -> None:
                 zorder=11,
                 path_effects=[pe.withStroke(linewidth=2.5, foreground='white')])
 
-    # ---- HEADER (top): static trip title ----
-    fig.text(0.5, 0.955, "Globetrotting",
+    # ---- HEADER (top) ----
+    fig.text(0.5, 0.965, "Globetrotting",
              ha='center', va='top', fontsize=38,
              color=TEXT_COLOR, fontweight='bold',
              family='serif', fontstyle='italic')
-    fig.text(0.5, 0.918, "May 11  –  May 19",
-             ha='center', va='top', fontsize=20,
+    fig.text(0.5, 0.928, "May 11  –  May 19",
+             ha='center', va='top', fontsize=18,
              color=MUTED, fontweight='bold',
              family='monospace')
+
+    # Mid-flight info card (codes · distance · duration)
+    seg = state.get("active_segment")
+    if seg is not None and state.get("phase") in ("departure", "flight", "arrival"):
+        info = (f"{seg['from_code']}  →  {seg['to_code']}     "
+                f"{format_km(seg['distance_km'])}     "
+                f"{format_hours(seg['duration_hours'])}")
+        fig.text(0.5, 0.892, info,
+                 ha='center', va='top', fontsize=14,
+                 color=seg["color"], fontweight='bold',
+                 family='monospace',
+                 bbox=dict(boxstyle='round,pad=0.35',
+                           facecolor=(0, 0, 0, 0.55),
+                           edgecolor=seg["color"], linewidth=1.0))
+
+    # Cumulative-km odometer (top-right corner)
+    cum_km = state.get("cum_km", 0.0)
+    fig.text(0.94, 0.972, "TOTAL FLOWN",
+             ha='right', va='top', fontsize=9,
+             color=MUTED, fontweight='bold',
+             family='monospace')
+    fig.text(0.94, 0.955, format_km(cum_km).upper(),
+             ha='right', va='top', fontsize=16,
+             color=ACCENT, fontweight='bold',
+             family='monospace')
+
+    # End-spin big-stats reveal (fades in over the rotating globe)
+    if state.get("phase") == "end_spin":
+        a = state.get("stats_alpha", 0.0)
+        if a > 0:
+            # Translucent dark scrim across the globe area for legibility
+            scrim = plt.Rectangle((0.0, 300 / HEIGHT), 1.0, 1080 / HEIGHT,
+                                  transform=fig.transFigure,
+                                  facecolor=(0, 0, 0, 0.45 * a),
+                                  edgecolor='none', zorder=20)
+            fig.add_artist(scrim)
+            # Big stats stacked vertically inside the globe area
+            cx = 0.5
+            base_y = 0.66
+            line_h = 0.07
+            stats = [
+                ("TOTAL DISTANCE", format_km(TOTAL_DISTANCE_KM).upper(),  ACCENT),
+                ("TIME IN THE AIR", format_hours(TOTAL_FLIGHT_HOURS).upper(),  "#ff5b5b"),
+                ("COUNTRIES",       f"{COUNTRIES_VISITED}",                "#2bd47d"),
+                ("TIME ZONES",      f"{TIMEZONES_TOUCHED}",                "#b06ee6"),
+            ]
+            for i, (lbl, val, col) in enumerate(stats):
+                y = base_y - i * line_h
+                fig.text(cx, y, lbl,
+                         ha='center', va='center', fontsize=11,
+                         color=(1, 1, 1, 0.55 * a), fontweight='bold',
+                         family='monospace', zorder=21)
+                fig.text(cx, y - 0.028, val,
+                         ha='center', va='center', fontsize=26,
+                         color=(*plt.matplotlib.colors.to_rgb(col), a),
+                         fontweight='bold', family='monospace', zorder=21)
+            fig.text(cx, base_y - 4 * line_h - 0.01, "AROUND THE WORLD",
+                     ha='center', va='center', fontsize=15,
+                     color=(*plt.matplotlib.colors.to_rgb(ACCENT), a),
+                     fontweight='bold', family='serif', fontstyle='italic',
+                     zorder=21)
 
     # ---- FOOTER (bottom): destination + date strip ----
     n = len(DISPLAY_LEGS)
@@ -270,6 +435,9 @@ def compute_timeline() -> list[dict]:
         first_heading = heading_along(seg["geo"], 0.02)
         last_heading  = heading_along(seg["geo"], 0.98)
 
+        cum_before = seg["cum_km_end"] - seg["distance_km"]
+        cum_end    = seg["cum_km_end"]
+
         # Departure pause
         for _ in range(DEPARTURE_FRAMES):
             frames.append({
@@ -282,6 +450,9 @@ def compute_timeline() -> list[dict]:
                 "focus_city": seg["from"],
                 "active_display_leg": leg_idx,
                 "completed_display_legs": completed_before,
+                "cum_km": cum_before,
+                "active_segment": seg,
+                "phase": "departure",
             })
 
         # Flight
@@ -303,10 +474,14 @@ def compute_timeline() -> list[dict]:
                 "focus_city": None,
                 "active_display_leg": leg_idx,
                 "completed_display_legs": completed_before,
+                "cum_km": cum_before + (cum_end - cum_before) * t,
+                "active_segment": seg,
+                "phase": "flight",
+                "flight_t": t,
             })
 
         # Arrival pause
-        for _ in range(ARRIVAL_FRAMES):
+        for i in range(ARRIVAL_FRAMES):
             frames.append({
                 "cam_lon": arr_lon, "cam_lat": arr_lat,
                 "altitude": LOW_ALT,
@@ -317,6 +492,10 @@ def compute_timeline() -> list[dict]:
                 "focus_city": seg["to"],
                 "active_display_leg": leg_idx,
                 "completed_display_legs": completed_after,
+                "cum_km": cum_end,
+                "active_segment": seg,
+                "phase": "arrival",
+                "landing_pulse": i,  # 0,1,2,... — render shows expanding ring for small values
             })
 
     # End spin: wide globe view doing a full 360° rotation, all routes visible
@@ -325,6 +504,8 @@ def compute_timeline() -> list[dict]:
     aus_lon, aus_lat = CITIES["Austin"][:2]
     for i in range(END_SPIN_FRAMES):
         rot = (i / END_SPIN_FRAMES) * 360.0
+        # Stats reveal: fade in after first 8 frames, fully visible by frame 24, hold
+        stats_t = max(0.0, min(1.0, (i - 8) / 16.0))
         frames.append({
             "cam_lon": aus_lon + rot,
             "cam_lat": aus_lat,
@@ -336,6 +517,10 @@ def compute_timeline() -> list[dict]:
             "focus_city": None,
             "active_display_leg": last_leg,
             "completed_display_legs": completed_all,
+            "cum_km": TOTAL_DISTANCE_KM,
+            "active_segment": None,
+            "phase": "end_spin",
+            "stats_alpha": stats_t,
         })
 
     return frames
