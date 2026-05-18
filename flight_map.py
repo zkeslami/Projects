@@ -38,10 +38,10 @@ SEGMENTS = [
 ]
 
 DISPLAY_LEGS = [
-    {"date": "MAY 11", "label": "AUSTIN  →  LONDON",                "color": "#3aa0ff"},
-    {"date": "MAY 12", "label": "LONDON  →  BANGALORE",             "color": "#b06ee6"},
-    {"date": "MAY 15", "label": "BANGALORE  →  SINGAPORE",          "color": "#2bd47d"},
-    {"date": "MAY 19", "label": "SINGAPORE  →  SF  →  AUSTIN",      "color": "#ff5b5b"},
+    {"date": "May 11", "destination": "London",    "label": "AUSTIN  →  LONDON",           "color": "#3aa0ff"},
+    {"date": "May 12", "destination": "Bangalore", "label": "LONDON  →  BANGALORE",        "color": "#b06ee6"},
+    {"date": "May 15", "destination": "Singapore", "label": "BANGALORE  →  SINGAPORE",     "color": "#2bd47d"},
+    {"date": "May 19", "destination": "Austin",    "label": "SINGAPORE  →  SF  →  AUSTIN", "color": "#ff5b5b"},
 ]
 
 LOW_ALT  =  4_000_000   # zoomed in, ~50° visible
@@ -50,7 +50,7 @@ HIGH_ALT = 22_000_000   # zoomed out, globe view
 DEPARTURE_FRAMES = 8    # camera holds at departure city
 FLIGHT_FRAMES    = 56   # plane in motion + camera follow
 ARRIVAL_FRAMES   = 14   # camera holds at arrival city
-END_PAUSE_FRAMES = 36   # final rotating wide view
+END_SPIN_FRAMES  = 96   # final 360° rotation showing all legs
 FPS = 24
 
 WIDTH, HEIGHT = 1080, 1920
@@ -142,13 +142,16 @@ def render_frame(state: dict, out_path: FsPath) -> None:
     ax = plt.axes([0.0, 300 / HEIGHT, 1.0, 1080 / HEIGHT], projection=proj)
     setup_globe(ax)
 
+    route_halo = [pe.withStroke(linewidth=7.5, foreground="white", alpha=0.85)]
+
     # Completed routes (full dashed line)
     for r in state["completed_routes"]:
         pts = r["geo"]
         ax.plot(pts[:, 0], pts[:, 1], color=r["color"],
-                linewidth=2.6, linestyle=(0, (6, 4)),
+                linewidth=4.2, linestyle=(0, (7, 4)),
                 transform=ccrs.Geodetic(), zorder=5,
-                solid_capstyle="round")
+                solid_capstyle="round",
+                path_effects=route_halo)
 
     # Active partial route
     if state["active_route"] is not None:
@@ -157,9 +160,10 @@ def render_frame(state: dict, out_path: FsPath) -> None:
         n = max(2, int(len(pts) * state["active_progress"]))
         sub = pts[:n]
         ax.plot(sub[:, 0], sub[:, 1], color=r["color"],
-                linewidth=2.6, linestyle=(0, (6, 4)),
+                linewidth=4.2, linestyle=(0, (7, 4)),
                 transform=ccrs.Geodetic(), zorder=5,
-                solid_capstyle="round")
+                solid_capstyle="round",
+                path_effects=route_halo)
 
     # City dots (drawn always; cartopy hides ones on the far side)
     for name, (lon, lat, _) in CITIES.items():
@@ -194,49 +198,55 @@ def render_frame(state: dict, out_path: FsPath) -> None:
                 zorder=11,
                 path_effects=[pe.withStroke(linewidth=2.5, foreground='white')])
 
-    # ---- HEADER (top) ----
-    leg = DISPLAY_LEGS[state["active_display_leg"]]
-    fig.text(0.5, 0.965, "FLIGHT ITINERARY",
-             ha='center', va='top', fontsize=12,
-             color=MUTED, fontweight='bold')
-    fig.text(0.5, 0.945, leg["date"],
-             ha='center', va='top', fontsize=34,
-             color=leg["color"], fontweight='bold')
-    fig.text(0.5, 0.910, leg["label"],
-             ha='center', va='top', fontsize=17,
-             color=TEXT_COLOR, fontweight='bold', family='monospace')
+    # ---- HEADER (top): static trip title ----
+    fig.text(0.5, 0.955, "Globetrotting",
+             ha='center', va='top', fontsize=38,
+             color=TEXT_COLOR, fontweight='bold',
+             family='serif', fontstyle='italic')
+    fig.text(0.5, 0.918, "May 11  –  May 19",
+             ha='center', va='top', fontsize=20,
+             color=MUTED, fontweight='bold',
+             family='monospace')
 
-    # ---- FOOTER (bottom): progress strip ----
+    # ---- FOOTER (bottom): destination + date strip ----
     n = len(DISPLAY_LEGS)
-    y_dot = 0.090
-    y_lbl_date = 0.052
-    y_lbl_route = 0.027
+    y_dot      = 0.118
+    y_loc      = 0.075
+    y_date     = 0.040
+    edge_pad   = 0.10
+    span       = 1.0 - 2 * edge_pad
     for i, dleg in enumerate(DISPLAY_LEGS):
-        x = 0.16 + i * (0.68 / (n - 1))
-        if i in state["completed_display_legs"]:
-            color, size = dleg["color"], 22
-        elif i == state["active_display_leg"]:
-            color, size = dleg["color"], 28
+        x = edge_pad + i * (span / (n - 1))
+        completed = i in state["completed_display_legs"]
+        active    = i == state["active_display_leg"]
+        lit       = completed or active
+        if active and not completed:
+            color, dot_size = dleg["color"], 30
+        elif completed:
+            color, dot_size = dleg["color"], 24
         else:
-            color, size = "#3a3f4a", 18
+            color, dot_size = "#3a3f4a", 20
         fig.text(x, y_dot, "●", ha='center', va='center',
-                 fontsize=size, color=color)
-        # Date label below
-        active_or_done = (i in state["completed_display_legs"]
-                          or i == state["active_display_leg"])
-        lbl_color = dleg["color"] if active_or_done else "#555"
-        weight = 'bold' if i == state["active_display_leg"] else 'normal'
-        fig.text(x, y_lbl_date, dleg["date"].replace("MAY ", ""),
+                 fontsize=dot_size, color=color)
+        loc_color  = dleg["color"] if lit else "#555"
+        date_color = dleg["color"] if lit else "#444"
+        loc_weight = 'bold' if lit else 'normal'
+        fig.text(x, y_loc, dleg["destination"],
                  ha='center', va='center',
-                 fontsize=11, color=lbl_color, fontweight=weight)
-        # Connecting line between dots
+                 fontsize=15, color=loc_color, fontweight=loc_weight,
+                 family='sans-serif')
+        fig.text(x, y_date, dleg["date"],
+                 ha='center', va='center',
+                 fontsize=13, color=date_color,
+                 fontweight='normal', alpha=0.95 if lit else 0.7)
+        # Connecting line between dots — solid when the leg into the *next* stop is done
         if i < n - 1:
-            x_next = 0.16 + (i + 1) * (0.68 / (n - 1))
-            color_line = ("#9aa3ad" if i in state["completed_display_legs"]
-                          else "#2a2f38")
-            fig.add_artist(plt.Line2D([x + 0.018, x_next - 0.018],
+            x_next = edge_pad + (i + 1) * (span / (n - 1))
+            done_to_next = (i + 1) in state["completed_display_legs"]
+            line_color = "#cfd5dc" if done_to_next else "#2a2f38"
+            fig.add_artist(plt.Line2D([x + 0.022, x_next - 0.022],
                                        [y_dot, y_dot],
-                                       color=color_line, linewidth=1.5,
+                                       color=line_color, linewidth=1.8,
                                        transform=fig.transFigure))
 
     fig.savefig(out_path, dpi=120, facecolor=fig.get_facecolor())
@@ -309,12 +319,12 @@ def compute_timeline() -> list[dict]:
                 "completed_display_legs": completed_after,
             })
 
-    # End pause: wide globe view slowly rotating
+    # End spin: wide globe view doing a full 360° rotation, all routes visible
     last_leg = len(DISPLAY_LEGS) - 1
     completed_all = set(range(len(DISPLAY_LEGS)))
     aus_lon, aus_lat = CITIES["Austin"][:2]
-    for i in range(END_PAUSE_FRAMES):
-        rot = (i / END_PAUSE_FRAMES) * 120  # rotate 120° east over the pause
+    for i in range(END_SPIN_FRAMES):
+        rot = (i / END_SPIN_FRAMES) * 360.0
         frames.append({
             "cam_lon": aus_lon + rot,
             "cam_lat": aus_lat,
